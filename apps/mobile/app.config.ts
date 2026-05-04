@@ -9,6 +9,13 @@ const config: ExpoConfig = {
   userInterfaceStyle: 'automatic',
   newArchEnabled: true,
 
+  updates: {
+    url: 'https://u.expo.dev/0c93a157-deaf-4d9e-b1f5-996992867d23',
+  },
+  runtimeVersion: {
+    policy: 'appVersion',
+  },
+
   splash: {
 
     resizeMode: 'contain',
@@ -51,7 +58,7 @@ const config: ExpoConfig = {
     apiBaseUrl: process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000/v1',
     sentryDsn: process.env.EXPO_PUBLIC_SENTRY_DSN ?? '',
     eas: {
-      projectId: process.env.EXPO_PUBLIC_EAS_PROJECT_ID ?? '',
+      projectId: process.env.EXPO_PUBLIC_EAS_PROJECT_ID ?? '0c93a157-deaf-4d9e-b1f5-996992867d23',
     },
   },
 };
