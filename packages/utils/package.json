@@ -1,0 +1,23 @@
+{
+  "name": "@finance-os/utils",
+  "version": "0.1.0",
+  "private": true,
+"main": "./dist/index.js",
+"types": "./dist/index.d.ts",
+  "scripts": {
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build":"tsc",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist .turbo"
+  },
+  "dependencies": {
+    "decimal.js": "^10.4.3",
+    "date-fns": "^4.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

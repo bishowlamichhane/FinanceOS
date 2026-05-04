@@ -1,0 +1,21 @@
+{
+  "name": "@finance-os/contracts",
+  "version": "0.1.0",
+  "private": true,
+
+  "main": "./dist/index.js",
+"types": "./dist/index.d.ts",
+  "scripts": {
+  "build": "tsc",
+  "lint": "echo 'no lint'",
+  "typecheck": "tsc --noEmit",
+  "test": "echo 'no tests'",
+  "clean": "rm -rf dist .turbo"
+},
+  "dependencies": {
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

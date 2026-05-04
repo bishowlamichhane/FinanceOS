@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm typecheck *)",
+      "Bash(ipconfig)",
+      "Bash(findstr /i \"IPv4\")",
+      "WebSearch"
+    ]
+  }
+}

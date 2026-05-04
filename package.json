@@ -1,0 +1,35 @@
+{
+  "name": "finance-os",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Finance OS Nepal — personal finance + portfolio tracker",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "api:dev": "pnpm --filter @finance-os/api dev",
+    "mobile:dev": "pnpm --filter @finance-os/mobile dev",
+    "db:migrate": "pnpm --filter @finance-os/api db:migrate",
+    "db:seed": "pnpm --filter @finance-os/api db:seed",
+    "db:studio": "pnpm --filter @finance-os/api db:studio"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "prettier": "^3.4.2",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20.10.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.15.0"
+}

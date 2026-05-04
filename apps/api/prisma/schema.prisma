@@ -1,0 +1,849 @@
+// Finance OS Nepal — Prisma schema
+// =================================
+//
+// Conventions:
+//   - UUIDs for all PKs (db-generated via gen_random_uuid()).
+//   - Money columns are Decimal(18, 4): ~14 digits before decimal, 4 after.
+//     14 digits handles up to ~10^14 NPR (a quadrillion rupees). 4dp is enough
+//     for any conventional currency including paise.
+//   - Every financial table has user_id and is indexed on it.
+//   - Every financial table has soft-delete (deleted_at).
+//   - timestamps: created_at and updated_at on most tables.
+//   - currency on every money-bearing row (default NPR) for future multi-FX.
+//   - Audit log entries are created via Prisma middleware in src/prisma.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+ output          = "./generated/client"
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgcrypto,citext]
+}
+
+// =============================================================================
+// IDENTITY & AUTH
+// =============================================================================
+
+model User {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email           String    @unique @db.Citext
+  passwordHash    String    @map("password_hash")
+  name            String
+  emailVerifiedAt DateTime? @map("email_verified_at")
+  /// Argon2 hash of user PIN. Stored on backend so PIN can be reset; mobile
+  /// also caches a copy in SecureStore for offline lock check.
+  pinHash         String?   @map("pin_hash")
+  /// Failed PIN attempts since last success. Locks at 5.
+  pinFailedCount  Int       @default(0) @map("pin_failed_count")
+  pinLockedUntil  DateTime? @map("pin_locked_until")
+  role            UserRole  @default(USER)
+  preferences     Json      @default("{}") @db.JsonB
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  deletedAt       DateTime? @map("deleted_at")
+
+  sessions          Session[]
+  accounts          Account[]
+  categories        Category[]
+  tags              Tag[]
+  transactions      Transaction[]
+  recurring         RecurringTransaction[]
+  budgets           Budget[]
+  budgetPeriods     BudgetPeriod[]
+  assets            Asset[]
+  liabilities       Liability[]
+  stockHoldings    StockHolding[]
+  stockTransactions StockTransaction[]
+  watchlistItems    WatchlistItem[]
+  importJobs        ImportJob[]
+  importTemplates   ImportTemplate[]
+  notifications     Notification[]
+  netWorthSnapshots NetWorthSnapshot[]
+  passwordResets    PasswordReset[]
+
+  @@index([deletedAt])
+  @@map("users")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+
+  @@map("user_role")
+}
+
+model Session {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  /// SHA-256 of the refresh token; we never store the raw token.
+  refreshHash  String   @unique @map("refresh_hash")
+  deviceName   String?  @map("device_name")
+  ipAddress    String?  @map("ip_address")
+  userAgent    String?  @map("user_agent") @db.Text
+  /// Set when refresh token is rotated. Old session invalidated atomically.
+  replacedById String?  @map("replaced_by_id") @db.Uuid
+  revokedAt    DateTime? @map("revoked_at")
+  expiresAt    DateTime  @map("expires_at")
+  lastSeenAt   DateTime  @default(now()) @map("last_seen_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model PasswordReset {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  tokenHash String   @unique @map("token_hash")
+  usedAt    DateTime? @map("used_at")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_resets")
+}
+
+// =============================================================================
+// FINANCIAL ACCOUNTS
+// =============================================================================
+
+enum AccountType {
+  CASH
+  BANK_SAVINGS
+  BANK_CURRENT
+  FIXED_DEPOSIT
+  WALLET
+  CREDIT_CARD
+  LOAN
+  INVESTMENT
+  OTHER
+
+  @@map("account_type")
+}
+
+model Account {
+  id                  String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId              String      @map("user_id") @db.Uuid
+  name                String
+  type                AccountType
+  bankName            String?     @map("bank_name")
+  /// Last 4 digits of account number — never store full number.
+  accountNumberLast4  String?     @map("account_number_last4") @db.VarChar(4)
+  currency            String      @default("NPR") @db.VarChar(3)
+  openingBalance      Decimal     @default(0) @map("opening_balance") @db.Decimal(18, 4)
+  /// Funds reserved / on hold (pending checks, security holds, etc).
+  /// Available balance = currentBalance - holdBalance.
+  holdBalance         Decimal     @default(0) @map("hold_balance") @db.Decimal(18, 4)
+  /// Hex color, optional. Drives card accent.
+  colorHex            String?     @map("color_hex") @db.VarChar(7)
+  /// Lucide icon key.
+  icon                String      @default("wallet")
+  notes               String?     @db.Text
+  archived            Boolean     @default(false)
+  createdAt           DateTime    @default(now()) @map("created_at")
+  updatedAt           DateTime    @updatedAt @map("updated_at")
+  deletedAt           DateTime?   @map("deleted_at")
+
+  user                  User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions          Transaction[]              @relation("AccountTransactions")
+  counterTransactions   Transaction[]              @relation("CounterAccountTransactions")
+  balanceSnapshots      AccountBalanceSnapshot[]
+  recurring             RecurringTransaction[]
+
+  @@index([userId, archived, deletedAt])
+  @@map("accounts")
+}
+
+/// Periodic snapshots — used for account balance history charts.
+/// Inserted nightly by a job, plus on every reconciliation.
+model AccountBalanceSnapshot {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId String   @map("account_id") @db.Uuid
+  date      DateTime @db.Date
+  balance   Decimal  @db.Decimal(18, 4)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, date])
+  @@index([accountId, date(sort: Desc)])
+  @@map("account_balance_snapshots")
+}
+
+// =============================================================================
+// CATEGORIES & TAGS
+// =============================================================================
+
+enum CategoryType {
+  INCOME
+  EXPENSE
+  TRANSFER
+
+  @@map("category_type")
+}
+
+model Category {
+  id        String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String       @map("user_id") @db.Uuid
+  name      String
+  icon      String       @default("circle")
+  colorHex  String       @default("#94A3B8") @map("color_hex") @db.VarChar(7)
+  type      CategoryType
+  parentId  String?      @map("parent_id") @db.Uuid
+  /// True for system-seeded defaults; users can't delete these but can hide.
+  isSystem  Boolean      @default(false) @map("is_system")
+  archived  Boolean      @default(false)
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+  deletedAt DateTime?    @map("deleted_at")
+
+  user         User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent       Category?              @relation("Subcategories", fields: [parentId], references: [id])
+  children     Category[]             @relation("Subcategories")
+  transactions Transaction[]
+  budgets      Budget[]
+  recurring    RecurringTransaction[]
+
+  @@unique([userId, name, parentId])
+  @@index([userId, type, archived, deletedAt])
+  @@map("categories")
+}
+
+model Tag {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  name      String
+  colorHex  String   @default("#94A3B8") @map("color_hex") @db.VarChar(7)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactionTags TransactionTag[]
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("tags")
+}
+
+// =============================================================================
+// TRANSACTIONS
+// =============================================================================
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+  TRANSFER
+  INVESTMENT_BUY
+  INVESTMENT_SELL
+  DIVIDEND
+  LIABILITY_PAYMENT
+  ASSET_PURCHASE
+  ADJUSTMENT
+
+  @@map("transaction_type")
+}
+
+model Transaction {
+  id          String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String          @map("user_id") @db.Uuid
+  date        DateTime        @db.Date
+  type        TransactionType
+  amount      Decimal         @db.Decimal(18, 4)
+  currency    String          @default("NPR") @db.VarChar(3)
+  description String
+  merchant    String?
+  notes       String?         @db.Text
+
+  accountId        String? @map("account_id") @db.Uuid
+  /// For TRANSFER: the receiving account. Single transaction with two
+  /// account references avoids the dual-row consistency problem.
+  counterAccountId String? @map("counter_account_id") @db.Uuid
+  categoryId       String? @map("category_id") @db.Uuid
+
+  /// Linkage to other domain objects.
+  recurringId     String? @map("recurring_id") @db.Uuid
+  assetId         String? @map("asset_id") @db.Uuid
+  liabilityId     String? @map("liability_id") @db.Uuid
+  stockHoldingId  String? @map("stock_holding_id") @db.Uuid
+  stockTransactionId String? @unique @map("stock_transaction_id") @db.Uuid
+
+  /// Local URI on mobile; remote object key once we add cloud storage.
+  attachmentUrl   String? @map("attachment_url")
+
+  /// Split-transaction support: when true, this transaction is composed of
+  /// children that sum to its amount. Children point to it via splitParentId.
+  isSplit         Boolean @default(false) @map("is_split")
+  splitParentId   String? @map("split_parent_id") @db.Uuid
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  user            User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account         Account?              @relation("AccountTransactions", fields: [accountId], references: [id], onDelete: SetNull)
+  counterAccount  Account?              @relation("CounterAccountTransactions", fields: [counterAccountId], references: [id], onDelete: SetNull)
+  category        Category?             @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  recurring       RecurringTransaction? @relation(fields: [recurringId], references: [id], onDelete: SetNull)
+  asset           Asset?                @relation(fields: [assetId], references: [id], onDelete: SetNull)
+  liability       Liability?            @relation(fields: [liabilityId], references: [id], onDelete: SetNull)
+  stockHolding    StockHolding?         @relation(fields: [stockHoldingId], references: [id], onDelete: SetNull)
+  stockTransaction StockTransaction?    @relation(fields: [stockTransactionId], references: [id], onDelete: SetNull)
+  splitParent     Transaction?          @relation("TransactionSplits", fields: [splitParentId], references: [id], onDelete: Cascade)
+  splitChildren   Transaction[]         @relation("TransactionSplits")
+  tags            TransactionTag[]
+
+  @@index([userId, date(sort: Desc), deletedAt])
+  @@index([userId, type, date(sort: Desc)])
+  @@index([userId, accountId, date(sort: Desc)])
+  @@index([userId, categoryId, date(sort: Desc)])
+  @@index([recurringId])
+  @@map("transactions")
+}
+
+model TransactionTag {
+  transactionId String @map("transaction_id") @db.Uuid
+  tagId         String @map("tag_id") @db.Uuid
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  tag         Tag         @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([transactionId, tagId])
+  @@index([tagId])
+  @@map("transaction_tags")
+}
+
+enum Recurrence {
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  QUARTERLY
+  YEARLY
+
+  @@map("recurrence")
+}
+
+model RecurringTransaction {
+  id          String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String          @map("user_id") @db.Uuid
+  description String
+  amount      Decimal         @db.Decimal(18, 4)
+  currency    String          @default("NPR") @db.VarChar(3)
+  type        TransactionType
+  categoryId  String?         @map("category_id") @db.Uuid
+  accountId   String?         @map("account_id") @db.Uuid
+
+  frequency  Recurrence
+  startDate  DateTime  @map("start_date") @db.Date
+  endDate    DateTime? @map("end_date") @db.Date
+  nextDate   DateTime  @map("next_date") @db.Date
+
+  /// When true, scheduler creates transactions automatically.
+  /// When false, app surfaces a reminder for user to confirm.
+  autoPost   Boolean @default(false) @map("auto_post")
+  active     Boolean @default(true)
+  notes      String? @db.Text
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category     Category?     @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  account      Account?      @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  transactions Transaction[]
+
+  @@index([userId, active, nextDate])
+  @@map("recurring_transactions")
+}
+
+// =============================================================================
+// BUDGETS
+// =============================================================================
+
+model Budget {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  /// Null categoryId = overall monthly budget.
+  categoryId  String?  @map("category_id") @db.Uuid
+  /// Monthly only for now; field kept for future flexibility.
+  period      Recurrence @default(MONTHLY)
+  amount      Decimal  @db.Decimal(18, 4)
+  currency    String   @default("NPR") @db.VarChar(3)
+  startDate   DateTime @map("start_date") @db.Date
+  /// Notification thresholds — typically 0.5, 0.8, 1.0
+  alertThresholds Decimal[] @default([0.5, 0.8, 1.0]) @map("alert_thresholds") @db.Decimal(3, 2)
+  archived    Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category?      @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  periods  BudgetPeriod[]
+
+  @@unique([userId, categoryId, period, startDate])
+  @@index([userId, archived, deletedAt])
+  @@map("budgets")
+}
+
+/// Snapshot per period — actuals frozen so historical reports stay stable
+/// even if old transactions are edited.
+model BudgetPeriod {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  budgetId   String   @map("budget_id") @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  startDate  DateTime @map("start_date") @db.Date
+  endDate    DateTime @map("end_date") @db.Date
+  budgetedAmount Decimal @map("budgeted_amount") @db.Decimal(18, 4)
+  spentAmount    Decimal @default(0) @map("spent_amount") @db.Decimal(18, 4)
+  /// Highest threshold crossed; resets when a new period starts.
+  lastAlertAt    DateTime? @map("last_alert_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  budget Budget @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([budgetId, startDate])
+  @@index([userId, startDate(sort: Desc)])
+  @@map("budget_periods")
+}
+
+// =============================================================================
+// ASSETS & LIABILITIES
+// =============================================================================
+
+enum AssetType {
+  CASH
+  BANK_BALANCE
+  STOCK_PORTFOLIO
+  FIXED_DEPOSIT
+  GOLD
+  VEHICLE
+  PROPERTY
+  ELECTRONICS
+  CRYPTO
+  OTHER
+
+  @@map("asset_type")
+}
+
+model Asset {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  name         String
+  type         AssetType
+  /// Current value — denormalized from latest valuation snapshot.
+  currentValue Decimal   @default(0) @map("current_value") @db.Decimal(18, 4)
+  currency     String    @default("NPR") @db.VarChar(3)
+  /// Original purchase or acquisition date, optional.
+  acquiredAt   DateTime? @map("acquired_at") @db.Date
+  /// Original cost, for ROI tracking.
+  acquiredCost Decimal?  @map("acquired_cost") @db.Decimal(18, 4)
+  notes        String?   @db.Text
+  /// e.g. asset linked to a specific account for liquid balance.
+  linkedAccountId String? @map("linked_account_id") @db.Uuid
+  archived     Boolean   @default(false)
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  user           User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  valueHistory   AssetValueSnapshot[]
+  transactions   Transaction[]
+
+  @@index([userId, archived, deletedAt])
+  @@index([userId, type])
+  @@map("assets")
+}
+
+model AssetValueSnapshot {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  assetId   String   @map("asset_id") @db.Uuid
+  date      DateTime @db.Date
+  value     Decimal  @db.Decimal(18, 4)
+  source    String   @default("manual") /// "manual" | "import" | "computed"
+  notes     String?  @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([assetId, date])
+  @@index([assetId, date(sort: Desc)])
+  @@map("asset_value_history")
+}
+
+enum LiabilityType {
+  PERSONAL_LOAN
+  CREDIT_CARD
+  EDUCATION_LOAN
+  FAMILY_FRIEND_LOAN
+  EMI
+  MORTGAGE
+  OTHER
+
+  @@map("liability_type")
+}
+
+model Liability {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId          String        @map("user_id") @db.Uuid
+  name            String
+  type            LiabilityType
+  principal       Decimal       @db.Decimal(18, 4)
+  /// Current outstanding balance — denormalized from payment history.
+  outstanding     Decimal       @db.Decimal(18, 4)
+  currency        String        @default("NPR") @db.VarChar(3)
+  /// Annual interest rate as a decimal: 0.12 means 12% APR.
+  interestRate    Decimal       @default(0) @map("interest_rate") @db.Decimal(6, 4)
+  minimumPayment  Decimal?      @map("minimum_payment") @db.Decimal(18, 4)
+  /// Day of month payment is due (1-28).
+  dueDay          Int?          @map("due_day")
+  notes           String?       @db.Text
+  archived        Boolean       @default(false)
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+  deletedAt       DateTime?     @map("deleted_at")
+
+  user         User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  payments     LiabilityPayment[]
+  transactions Transaction[]
+
+  @@index([userId, archived, deletedAt])
+  @@map("liabilities")
+}
+
+model LiabilityPayment {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  liabilityId  String   @map("liability_id") @db.Uuid
+  date         DateTime @db.Date
+  amount       Decimal  @db.Decimal(18, 4)
+  /// Of the payment, how much went to principal vs interest. Nullable when
+  /// user enters a flat amount without breakdown.
+  principalPart Decimal? @map("principal_part") @db.Decimal(18, 4)
+  interestPart  Decimal? @map("interest_part") @db.Decimal(18, 4)
+  notes        String?  @db.Text
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  liability Liability @relation(fields: [liabilityId], references: [id], onDelete: Cascade)
+
+  @@index([liabilityId, date(sort: Desc)])
+  @@map("liability_payments")
+}
+
+// =============================================================================
+// STOCKS / NEPSE
+// =============================================================================
+
+/// Master list of NEPSE-listed companies. Seeded from a maintained CSV.
+/// Not user-scoped — shared reference data.
+model StockSymbol {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  symbol      String  @unique
+  companyName String  @map("company_name")
+  sector      String?
+  exchange    String  @default("NEPSE")
+  currency    String  @default("NPR") @db.VarChar(3)
+  /// Number of shares outstanding (for some allocation calcs). Optional.
+  totalShares Decimal? @map("total_shares") @db.Decimal(18, 0)
+  /// Whether trading is active. Suspended/delisted symbols stay for history.
+  isActive    Boolean @default(true) @map("is_active")
+  notes       String? @db.Text
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  holdings StockHolding[]
+  prices   StockPrice[]
+watchlistItems WatchlistItem[]
+  @@index([sector, isActive])
+  @@map("stock_symbols")
+}
+
+model StockHolding {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  symbolId     String   @map("symbol_id") @db.Uuid
+  /// Optional: the user's broker account for this holding.
+  broker       String?
+  /// Optional: the user's demat account number (last 4 only for display).
+  dematLast4   String?  @map("demat_last4") @db.VarChar(4)
+  /// Denormalized state — replayed from stock_transactions on each mutation.
+  /// Source of truth is the transaction log.
+  quantity     Decimal  @default(0) @db.Decimal(18, 6)
+  wacc         Decimal  @default(0) @db.Decimal(18, 4)
+  costBasis    Decimal  @default(0) @map("cost_basis") @db.Decimal(18, 4)
+  realizedGain Decimal  @default(0) @map("realized_gain") @db.Decimal(18, 4)
+  notes        String?  @db.Text
+  archived     Boolean  @default(false)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  user         User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  symbol       StockSymbol        @relation(fields: [symbolId], references: [id])
+  transactions StockTransaction[]
+  ledger       Transaction[]
+
+  @@unique([userId, symbolId, broker])
+  @@index([userId, archived, deletedAt])
+  @@map("stock_holdings")
+}
+
+enum StockTransactionKind {
+  BUY
+  SELL
+  IPO
+  BONUS
+  RIGHT
+  DIVIDEND
+  SPLIT
+  ADJUSTMENT
+
+  @@map("stock_transaction_kind")
+}
+
+model StockTransaction {
+  id            String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String                @map("user_id") @db.Uuid
+  holdingId     String                @map("holding_id") @db.Uuid
+  kind          StockTransactionKind
+  date          DateTime              @db.Date
+  quantity      Decimal               @db.Decimal(18, 6)
+  /// Per-share price. For BONUS/SPLIT this is 0 / unused.
+  pricePerShare Decimal               @default(0) @map("price_per_share") @db.Decimal(18, 4)
+  /// Broker fees + SEBON fee + capital gains tax, lumped.
+  fees          Decimal               @default(0) @db.Decimal(18, 4)
+  /// For SPLIT: the ratio (1-for-N).
+  splitRatio    Decimal?              @map("split_ratio") @db.Decimal(8, 2)
+  notes         String?               @db.Text
+  /// Set by import jobs; null for manual entries.
+  importJobId   String?               @map("import_job_id") @db.Uuid
+  createdAt     DateTime              @default(now()) @map("created_at")
+  updatedAt     DateTime              @updatedAt @map("updated_at")
+  deletedAt     DateTime?             @map("deleted_at")
+
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  holding   StockHolding @relation(fields: [holdingId], references: [id], onDelete: Cascade)
+  importJob ImportJob?   @relation(fields: [importJobId], references: [id], onDelete: SetNull)
+  ledgerEntry Transaction?
+
+  @@index([userId, holdingId, date(sort: Desc)])
+  @@index([importJobId])
+  @@map("stock_transactions")
+}
+
+/// Price observations. Many sources can write here (manual, CSV, future API).
+model StockPrice {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  symbolId  String   @map("symbol_id") @db.Uuid
+  date      DateTime @db.Date
+  price     Decimal  @db.Decimal(18, 4)
+  source    String /// "manual" | "csv" | "nepse_unofficial" | etc.
+  observedAt DateTime @default(now()) @map("observed_at")
+
+  symbol StockSymbol @relation(fields: [symbolId], references: [id], onDelete: Cascade)
+
+  @@unique([symbolId, date, source])
+  @@index([symbolId, date(sort: Desc)])
+  @@map("stock_prices")
+}
+
+model WatchlistItem {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  symbolId  String   @map("symbol_id") @db.Uuid
+  /// User-set price alert threshold; notification triggers when crossed.
+  alertAbove Decimal? @map("alert_above") @db.Decimal(18, 4)
+  alertBelow Decimal? @map("alert_below") @db.Decimal(18, 4)
+  notes     String?  @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user   User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  symbol StockSymbol @relation(fields: [symbolId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, symbolId])
+  @@map("watchlist_items")
+}
+
+// =============================================================================
+// IMPORTS
+// =============================================================================
+
+enum ImportType {
+  BANK_STATEMENT
+  MEROSHARE_PORTFOLIO
+  MEROSHARE_TRANSACTIONS
+  MANUAL_TRANSACTIONS
+  STOCK_PRICES
+
+  @@map("import_type")
+}
+
+enum ImportStatus {
+  PENDING
+  MAPPING
+  PREVIEW
+  COMPLETED
+  FAILED
+  CANCELLED
+
+  @@map("import_status")
+}
+
+model ImportJob {
+  id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String       @map("user_id") @db.Uuid
+  type         ImportType
+  status       ImportStatus @default(PENDING)
+  filename     String
+  /// Raw mime type for diagnostics.
+  mimeType     String       @map("mime_type")
+  /// Object storage key (or local path in dev).
+  storageKey   String       @map("storage_key")
+  /// Number of rows detected in the file.
+  totalRows    Int          @default(0) @map("total_rows")
+  importedRows Int          @default(0) @map("imported_rows")
+  skippedRows  Int          @default(0) @map("skipped_rows")
+  /// Column-mapping config saved once user maps headers.
+  mapping      Json?        @db.JsonB
+  /// Account these rows post into (for bank statement imports).
+  targetAccountId String?   @map("target_account_id") @db.Uuid
+  /// Saved template applied during import (if any).
+  templateId   String?      @map("template_id") @db.Uuid
+  errorReport  Json?        @map("error_report") @db.JsonB
+  startedAt    DateTime?    @map("started_at")
+  completedAt  DateTime?    @map("completed_at")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  user             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rows             ImportRow[]
+  template         ImportTemplate?    @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  stockTransactions StockTransaction[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("import_jobs")
+}
+
+model ImportRow {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  importJobId String   @map("import_job_id") @db.Uuid
+  rowIndex    Int      @map("row_index")
+  /// Raw CSV row as a JSON object (column name -> value).
+  rawData     Json     @map("raw_data") @db.JsonB
+  /// Parsed row after mapping is applied; null while mapping pending.
+  parsedData  Json?    @map("parsed_data") @db.JsonB
+  /// Was this row imported, skipped (duplicate), or failed?
+  status      String   @default("pending")
+  errorMessage String? @map("error_message")
+  /// FK to the resulting Transaction or StockTransaction, if imported.
+  resultId    String?  @map("result_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  job ImportJob @relation(fields: [importJobId], references: [id], onDelete: Cascade)
+
+  @@index([importJobId, rowIndex])
+  @@map("import_rows")
+}
+
+/// Saved import templates — "this is how Nabil's CSV maps to my fields".
+/// Reusable across import jobs.
+model ImportTemplate {
+  id        String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String     @map("user_id") @db.Uuid
+  name      String
+  type      ImportType
+  /// JSON describing column-to-field mapping + default values.
+  mapping   Json       @db.JsonB
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+
+  user User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobs ImportJob[]
+
+  @@unique([userId, name])
+  @@map("import_templates")
+}
+
+// =============================================================================
+// NOTIFICATIONS & AUDIT
+// =============================================================================
+
+enum NotificationKind {
+  BUDGET_WARN
+  BUDGET_NEAR
+  BUDGET_OVER
+  RECURRING_DUE
+  LIABILITY_DUE
+  STOCK_ALERT
+  IMPORT_COMPLETE
+  REPORT_READY
+  SECURITY_ALERT
+
+  @@map("notification_kind")
+}
+
+model Notification {
+  id        String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String           @map("user_id") @db.Uuid
+  kind      NotificationKind
+  title     String
+  body      String           @db.Text
+  /// JSON payload with relevant IDs to deep-link from the notification.
+  data      Json?            @db.JsonB
+  readAt    DateTime?        @map("read_at")
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+model NetWorthSnapshot {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  date        DateTime @db.Date
+  assets      Decimal  @db.Decimal(18, 4)
+  liabilities Decimal  @db.Decimal(18, 4)
+  netWorth    Decimal  @map("net_worth") @db.Decimal(18, 4)
+  currency    String   @default("NPR") @db.VarChar(3)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@index([userId, date(sort: Desc)])
+  @@map("net_worth_snapshots")
+}
+
+/// Append-only log of all financial mutations. Read-only via API.
+model AuditLog {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String?  @map("user_id") @db.Uuid
+  /// Affected entity table name + UUID.
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id") @db.Uuid
+  /// "create" | "update" | "delete" | "soft_delete" | "restore"
+  action     String
+  /// Before/after diff. Capped at 16KB to avoid bloating the log.
+  before     Json?    @db.JsonB
+  after      Json?    @db.JsonB
+  /// Source of the change — "api", "scheduler", "import:<job_id>", etc.
+  source     String   @default("api")
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
