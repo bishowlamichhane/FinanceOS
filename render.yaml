@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: finance-os-api
+    runtime: node
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    autoDeploy: true
+    buildCommand: |-
+      npm install -g pnpm@9.15.0 && pnpm install --frozen-lockfile && pnpm --filter @finance-os/contracts build && pnpm --filter @finance-os/utils build && pnpm --filter @finance-os/api db:generate && pnpm --filter @finance-os/api build
+    startCommand: |-
+      pnpm --filter @finance-os/api db:migrate:deploy && pnpm --filter @finance-os/api start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: API_PREFIX
+        value: v1
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: JWT_ACCESS_TTL
+        value: 15m
+      - key: JWT_REFRESH_TTL
+        value: 30d
+      - key: LOG_LEVEL
+        value: info
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: JWT_REFRESH_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
