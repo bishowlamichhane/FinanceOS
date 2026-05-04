@@ -11,7 +11,8 @@
     "lint": "eslint . --ext .ts,.tsx",
     "typecheck": "tsc --noEmit",
     "test": "echo 'no tests yet'",
-    "clean": "rm -rf .expo node_modules .turbo"
+    "clean": "rm -rf .expo node_modules .turbo",
+    "eas-build-post-install": "pnpm --filter @finance-os/contracts build && pnpm --filter @finance-os/utils build && pnpm --filter @finance-os/design-tokens build"
   },
   "dependencies": {
     "@expo-google-fonts/inter": "^0.2.3",
