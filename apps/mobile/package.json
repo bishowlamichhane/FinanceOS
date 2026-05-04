@@ -18,7 +18,6 @@
     "@expo-google-fonts/inter": "^0.2.3",
     "@expo-google-fonts/jetbrains-mono": "^0.2.3",
     "@expo-google-fonts/manrope": "^0.2.3",
-    "@expo/log-box": "^55.0.11",
     "@expo/metro-runtime": "^4.0.1",
     "@expo/vector-icons": "^14.0.4",
     "@finance-os/contracts": "workspace:*",
