@@ -4,7 +4,12 @@
       "Bash(pnpm typecheck *)",
       "Bash(ipconfig)",
       "Bash(findstr /i \"IPv4\")",
-      "WebSearch"
+      "WebSearch",
+      "Bash(pnpm why *)",
+      "Bash(pnpm --filter @finance-os/mobile why @expo/dom-webview)",
+      "Bash(npm view *)",
+      "Bash(pnpm install *)",
+      "Bash(pnpm list *)"
     ]
   }
 }

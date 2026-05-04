@@ -19,7 +19,8 @@
     "mobile:dev": "pnpm --filter @finance-os/mobile dev",
     "db:migrate": "pnpm --filter @finance-os/api db:migrate",
     "db:seed": "pnpm --filter @finance-os/api db:seed",
-    "db:studio": "pnpm --filter @finance-os/api db:studio"
+    "db:studio": "pnpm --filter @finance-os/api db:studio",
+    "eas-build-post-install": "pnpm --filter @finance-os/contracts build && pnpm --filter @finance-os/utils build && pnpm --filter @finance-os/design-tokens build"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
@@ -31,5 +32,10 @@
     "node": ">=20.10.0",
     "pnpm": ">=9.0.0"
   },
-  "packageManager": "pnpm@9.15.0"
+  "packageManager": "pnpm@9.15.0",
+  "pnpm": {
+    "overrides": {
+      "@expo/dom-webview": "0.0.2"
+    }
+  }
 }
